@@ -1,0 +1,513 @@
+/*
+ * Copyright (C) 2021-2025 LSPosed
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.lsposed.hiddenapibypass;
+
+import android.os.Build;
+import android.util.Log;
+
+
+
+import java.lang.invoke.MethodHandle;
+import java.lang.invoke.MethodHandles;
+import java.lang.reflect.Constructor;
+import java.lang.reflect.Executable;
+import java.lang.reflect.Field;
+import java.lang.reflect.InvocationTargetException;
+import java.lang.reflect.Method;
+import java.lang.reflect.Modifier;
+import java.lang.reflect.Type;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.stream.Collectors;
+
+import sun.misc.Unsafe;
+
+public final class HiddenApiBypass {
+    private static final String TAG = "HiddenApiBypass";
+    private static final Unsafe unsafe;
+    private static final long methodOffset;
+    private static final long classOffset;
+    private static final long artOffset;
+    private static final long methodsOffset;
+    private static final long iFieldOffset;
+    private static final long sFieldOffset;
+    private static final long artMethodSize;
+    private static final long artMethodBias;
+    private static final long artFieldSize;
+    private static final long artFieldBias;
+    private static final boolean instanceFieldHandleSupported;
+    private static final boolean staticFieldHandleSupported;
+    private static final Map<String, ClassLoader> fieldClassLoaders = new HashMap<>();
+    private static volatile long fieldDeclaringClassOffset = -1;
+    private static volatile long fieldTypeOffset = -1;
+
+    static {
+        try {
+            //noinspection JavaReflectionMemberAccess DiscouragedPrivateApi
+            unsafe = (Unsafe) Unsafe.class.getDeclaredMethod("getUnsafe").invoke(null);
+            assert unsafe != null;
+            long[] data = Helper.getCachedOffsetData();
+            if (data == null) {
+                data = readOffsetData(Helper.Executable.class, Helper.MethodHandle.class, Helper.Class.class);
+                Helper.setCachedOffsetData(data);
+            } else if (false) {
+                Log.d(TAG, "Using cached offset data");
+            }
+            methodOffset = data[0];
+            classOffset = data[1];
+            artOffset = data[2];
+            methodsOffset = data[3];
+            iFieldOffset = data[4];
+            sFieldOffset = data[5];
+            long[] rtData = readOffsetDataRT(artOffset, methodsOffset, iFieldOffset);
+            artMethodSize = rtData[0];
+            artMethodBias = rtData[1];
+            artFieldSize = rtData[2];
+            artFieldBias = rtData[3];
+            instanceFieldHandleSupported = Build.VERSION.SDK_INT < 37 && isFieldHandleSupported("i", "j");
+            staticFieldHandleSupported = Build.VERSION.SDK_INT < 37 && isFieldHandleSupported("s", "t");
+        } catch (ReflectiveOperationException e) {
+            Log.e(TAG, "Initialize error", e);
+            throw new ExceptionInInitializerError(e);
+        }
+    }
+
+    private static long[] readOffsetData(Class<?> executableClass, Class<?> methodHandleClass, Class<?> classClass) throws ReflectiveOperationException {
+        long methodOffset = unsafe.objectFieldOffset(executableClass.getDeclaredField("artMethod"));
+        long classOffset = unsafe.objectFieldOffset(executableClass.getDeclaredField("declaringClass"));
+        long artOffset = unsafe.objectFieldOffset(methodHandleClass.getDeclaredField("artFieldOrMethod"));
+        long methodsOffset = unsafe.objectFieldOffset(classClass.getDeclaredField("methods"));
+        long iFieldOffset;
+        long sFieldOffset;
+        try {
+            iFieldOffset = unsafe.objectFieldOffset(classClass.getDeclaredField("fields"));
+            sFieldOffset = iFieldOffset;
+        } catch (NoSuchFieldException e) {
+            iFieldOffset = unsafe.objectFieldOffset(classClass.getDeclaredField("iFields"));
+            sFieldOffset = unsafe.objectFieldOffset(classClass.getDeclaredField("sFields"));
+            if (isMergedFields(iFieldOffset)) {
+                sFieldOffset = iFieldOffset;
+            }
+        }
+
+        return new long[]{
+                methodOffset,
+                classOffset,
+                artOffset,
+                methodsOffset,
+                iFieldOffset,
+                sFieldOffset,
+        };
+    }
+
+    private static long[] readOffsetDataRT(long artOffset, long methodsOffset, long iFieldOffset) throws ReflectiveOperationException {
+        Method mA = Helper.NeverCall.class.getDeclaredMethod("a");
+        Method mB = Helper.NeverCall.class.getDeclaredMethod("b");
+        mA.setAccessible(true);
+        mB.setAccessible(true);
+        MethodHandle mhA = MethodHandles.lookup().unreflect(mA);
+        MethodHandle mhB = MethodHandles.lookup().unreflect(mB);
+        long aAddr = unsafe.getLong(mhA, artOffset);
+        long bAddr = unsafe.getLong(mhB, artOffset);
+        long aMethods = unsafe.getLong(Helper.NeverCall.class, methodsOffset);
+        long artMethodSize = bAddr - aAddr;
+        if (false) Log.v(TAG, artMethodSize + " " +
+                Long.toString(aAddr, 16) + ", " +
+                Long.toString(bAddr, 16) + ", " +
+                Long.toString(aMethods, 16));
+        long artMethodBias = aAddr - aMethods - artMethodSize;
+
+        Field fI = Helper.NeverCall.class.getDeclaredField("i");
+        Field fJ = Helper.NeverCall.class.getDeclaredField("j");
+        fI.setAccessible(true);
+        fJ.setAccessible(true);
+        MethodHandle mhI = MethodHandles.lookup().unreflectGetter(fI);
+        MethodHandle mhJ = MethodHandles.lookup().unreflectGetter(fJ);
+        long iAddr = unsafe.getLong(mhI, artOffset);
+        long jAddr = unsafe.getLong(mhJ, artOffset);
+        long iFields = unsafe.getLong(Helper.NeverCall.class, iFieldOffset);
+        long artFieldSize = jAddr - iAddr;
+        if (false) Log.v(TAG, artFieldSize + " " +
+                Long.toString(iAddr, 16) + ", " +
+                Long.toString(jAddr, 16) + ", " +
+                Long.toString(iFields, 16));
+        long artFieldBias = iAddr - iFields;
+
+        return new long[]{
+                artMethodSize,
+                artMethodBias,
+                artFieldSize,
+                artFieldBias,
+        };
+    }
+
+    private static boolean isMergedFields(long fieldOffset) {
+        long fields = unsafe.getLong(Helper.NeverCall.class, fieldOffset);
+        return fields != 0 && unsafe.getInt(fields) == 4;
+    }
+
+    private static ClassLoader getFieldClassLoader(String path) {
+        synchronized (fieldClassLoaders) {
+            ClassLoader classLoader = fieldClassLoaders.get(path);
+            if (classLoader == null) {
+                classLoader = new CoreOjClassLoader(path, HiddenApiBypass.class.getClassLoader());
+                fieldClassLoaders.put(path, classLoader);
+            }
+            return classLoader;
+        }
+    }
+
+    private static void ensureFieldOffsets() throws ReflectiveOperationException {
+        if (fieldDeclaringClassOffset >= 0) return;
+        synchronized (HiddenApiBypass.class) {
+            if (fieldDeclaringClassOffset >= 0) return;
+            ClassLoader bootClassloader = new CoreOjClassLoader();
+            Class<?> fieldClass = bootClassloader.loadClass(Field.class.getName());
+            long declaringClassOffset = unsafe.objectFieldOffset(fieldClass.getDeclaredField("declaringClass"));
+            long typeOffset = unsafe.objectFieldOffset(fieldClass.getDeclaredField("type"));
+            fieldTypeOffset = typeOffset;
+            fieldDeclaringClassOffset = declaringClassOffset;
+        }
+    }
+
+    private static boolean isFieldHandleSupported(String sourceName, String targetName) {
+        try {
+            Field source = Helper.NeverCall.class.getDeclaredField(sourceName);
+            Field target = Helper.NeverCall.class.getDeclaredField(targetName);
+            source.setAccessible(true);
+            target.setAccessible(true);
+            MethodHandle handle = MethodHandles.lookup().unreflectGetter(source);
+            MethodHandle targetHandle = MethodHandles.lookup().unreflectGetter(target);
+            long sourceArtField = unsafe.getLong(handle, artOffset);
+            long targetArtField = unsafe.getLong(targetHandle, artOffset);
+            try {
+                unsafe.putLong(handle, artOffset, targetArtField);
+                Field reflected = MethodHandles.reflectAs(Field.class, handle);
+                return reflected.getDeclaringClass() == Helper.NeverCall.class
+                        && targetName.equals(reflected.getName());
+            } finally {
+                unsafe.putLong(handle, artOffset, sourceArtField);
+            }
+        } catch (ReflectiveOperationException | RuntimeException | LinkageError e) {
+            if (false) Log.w(TAG, "MethodHandle field check failed", e);
+            return false;
+        }
+    }
+
+    /**
+     * create an instance of the given class {@code clazz} calling the restricted constructor with arguments {@code args}
+     *
+     * @param clazz    the class of the instance to new
+     * @param initargs arguments to call constructor
+     * @return the new instance
+     * @see Constructor#newInstance(Object...)
+     */
+    public static Object newInstance(Class<?> clazz, Object... initargs) throws NoSuchMethodException, IllegalAccessException, InvocationTargetException, InstantiationException {
+        Method stub = Helper.InvokeStub.class.getDeclaredMethod("invoke", Object[].class);
+        Constructor<?> ctor = Helper.InvokeStub.class.getDeclaredConstructor(Object[].class);
+        ctor.setAccessible(true);
+        long methods = unsafe.getLong(clazz, methodsOffset);
+        if (methods == 0) throw new NoSuchMethodException("Cannot find matching constructor");
+        int numMethods = unsafe.getInt(methods);
+        if (false) Log.d(TAG, clazz + " has " + numMethods + " methods");
+        for (int i = 0; i < numMethods; i++) {
+            long method = methods + i * artMethodSize + artMethodBias;
+            unsafe.putLong(stub, methodOffset, method);
+            if (false) Log.v(TAG, "got " + clazz.getTypeName() + "." + stub.getName() +
+                    "(" + Arrays.toString(stub.getParameterTypes()) + ")");
+            if ("<init>".equals(stub.getName())) {
+                unsafe.putLong(ctor, methodOffset, method);
+                unsafe.putObject(ctor, classOffset, clazz);
+                Class<?>[] params = ctor.getParameterTypes();
+                if (Helper.checkArgsForInvokeMethod(params, initargs))
+                    return ctor.newInstance(initargs);
+            }
+        }
+        throw new NoSuchMethodException("Cannot find matching constructor");
+    }
+
+    /**
+     * invoke a restrict method named {@code methodName} of the given class {@code clazz} with this object {@code thiz} and arguments {@code args}
+     *
+     * @param clazz      the class call the method on (this parameter is required because this method cannot call inherit method)
+     * @param thiz       this object, which can be {@code null} if the target method is static
+     * @param methodName the method name
+     * @param args       arguments to call the method with name {@code methodName}
+     * @return the return value of the method
+     * @see Method#invoke(Object, Object...)
+     */
+    public static Object invoke(Class<?> clazz, Object thiz, String methodName, Object... args) throws NoSuchMethodException, InvocationTargetException, IllegalAccessException {
+        if (thiz != null && !clazz.isInstance(thiz)) {
+            throw new IllegalArgumentException("this object is not an instance of the given class");
+        }
+        Method stub = Helper.InvokeStub.class.getDeclaredMethod("invoke", Object[].class);
+        stub.setAccessible(true);
+        long methods = unsafe.getLong(clazz, methodsOffset);
+        if (methods == 0) throw new NoSuchMethodException("Cannot find matching method");
+        int numMethods = unsafe.getInt(methods);
+        if (false) Log.d(TAG, clazz + " has " + numMethods + " methods");
+        for (int i = 0; i < numMethods; i++) {
+            long method = methods + i * artMethodSize + artMethodBias;
+            unsafe.putLong(stub, methodOffset, method);
+            if (false) Log.v(TAG, "got " + clazz.getTypeName() + "." + stub.getName() +
+                    "(" + Arrays.toString(stub.getParameterTypes()) + ")");
+            if (methodName.equals(stub.getName())) {
+                Class<?>[] params = stub.getParameterTypes();
+                if (Helper.checkArgsForInvokeMethod(params, args))
+                    return stub.invoke(thiz, args);
+            }
+        }
+        throw new NoSuchMethodException("Cannot find matching method");
+    }
+
+    /**
+     * get declared methods of given class without hidden api restriction
+     *
+     * @param clazz the class to fetch declared methods (including constructors with name `&lt;init&gt;`)
+     * @return list of declared methods of {@code clazz}
+     */
+    public static List<Executable> getDeclaredMethods(Class<?> clazz) {
+        if (clazz.isPrimitive() || clazz.isArray()) return List.of();
+        MethodHandle mh;
+        try {
+            Method mA = Helper.NeverCall.class.getDeclaredMethod("a");
+            mA.setAccessible(true);
+            mh = MethodHandles.lookup().unreflect(mA);
+        } catch (NoSuchMethodException | IllegalAccessException e) {
+            return List.of();
+        }
+        long methods = unsafe.getLong(clazz, methodsOffset);
+        if (methods == 0) return List.of();
+        int numMethods = unsafe.getInt(methods);
+        if (false) Log.d(TAG, clazz + " has " + numMethods + " methods");
+        List<Executable> list = new ArrayList<>(numMethods);
+        for (int i = 0; i < numMethods; i++) {
+            long method = methods + i * artMethodSize + artMethodBias;
+            unsafe.putLong(mh, artOffset, method);
+            Executable member = MethodHandles.reflectAs(Executable.class, mh);
+            if (false)
+                Log.v(TAG, "got " + clazz.getTypeName() + "." + member.getName() +
+                        "(" + Arrays.toString(member.getParameterTypes()) + ")");
+            list.add(member);
+        }
+        return list;
+    }
+
+    /**
+     * get a restrict method named {@code methodName} of the given class {@code clazz} with argument types {@code parameterTypes}
+     *
+     * @param clazz          the class where the expected method declares
+     * @param methodName     the expected method's name
+     * @param parameterTypes argument types of the expected method with name {@code methodName}
+     * @return the found method
+     * @throws NoSuchMethodException when no method matches the given parameters
+     * @see Class#getDeclaredMethod(String, Class[])
+     */
+    public static Method getDeclaredMethod(Class<?> clazz, String methodName, Class<?>... parameterTypes) throws NoSuchMethodException {
+        List<Executable> methods = getDeclaredMethods(clazz);
+        allMethods:
+        for (Executable method : methods) {
+            if (!method.getName().equals(methodName)) continue;
+            if (!(method instanceof Method)) continue;
+            Class<?>[] expectedTypes = method.getParameterTypes();
+            if (expectedTypes.length != parameterTypes.length) continue;
+            for (int i = 0; i < parameterTypes.length; ++i) {
+                if (parameterTypes[i] != expectedTypes[i]) continue allMethods;
+            }
+            return (Method) method;
+        }
+        throw new NoSuchMethodException("Cannot find matching method");
+    }
+
+    /**
+     * get a restrict constructor of the given class {@code clazz} with argument types {@code parameterTypes}
+     *
+     * @param clazz          the class where the expected constructor declares
+     * @param parameterTypes argument types of the expected constructor
+     * @return the found constructor
+     * @throws NoSuchMethodException when no constructor matches the given parameters
+     * @see Class#getDeclaredConstructor(Class[])
+     */
+    public static Constructor<?> getDeclaredConstructor(Class<?> clazz, Class<?>... parameterTypes) throws NoSuchMethodException {
+        List<Executable> methods = getDeclaredMethods(clazz);
+        allMethods:
+        for (Executable method : methods) {
+            if (!(method instanceof Constructor)) continue;
+            Class<?>[] expectedTypes = method.getParameterTypes();
+            if (expectedTypes.length != parameterTypes.length) continue;
+            for (int i = 0; i < parameterTypes.length; ++i) {
+                if (parameterTypes[i] != expectedTypes[i]) continue allMethods;
+            }
+            return (Constructor<?>) method;
+        }
+        throw new NoSuchMethodException("Cannot find matching constructor");
+    }
+
+
+    /**
+     * get declared non-static fields of given class without hidden api restriction
+     *
+     * @param clazz the class to fetch declared methods
+     * @return list of declared non-static fields of {@code clazz}
+     */
+    public static List<Field> getInstanceFields(Class<?> clazz) {
+        if (clazz.isPrimitive() || clazz.isArray()) return List.of();
+        if (!instanceFieldHandleSupported) return getFieldsFromClassLoader(clazz, false);
+        return getFieldsFromMethodHandle(clazz, false);
+    }
+
+    private static List<Field> getFieldsFromMethodHandle(Class<?> clazz, boolean wantStatic) {
+        MethodHandle mh;
+        try {
+            Field stub = Helper.NeverCall.class.getDeclaredField(wantStatic ? "s" : "i");
+            stub.setAccessible(true);
+            mh = MethodHandles.lookup().unreflectGetter(stub);
+        } catch (IllegalAccessException | NoSuchFieldException e) {
+            return List.of();
+        }
+        long fields = unsafe.getLong(clazz, wantStatic ? sFieldOffset : iFieldOffset);
+        if (fields == 0) return List.of();
+        int numFields = unsafe.getInt(fields);
+        if (false) Log.d(TAG, clazz + " has " + numFields + " fields");
+        List<Field> list = new ArrayList<>(numFields);
+        for (int i = 0; i < numFields; i++) {
+            long field = fields + i * artFieldSize + artFieldBias;
+            unsafe.putLong(mh, artOffset, field);
+            Field member = MethodHandles.reflectAs(Field.class, mh);
+            if (false)
+                Log.v(TAG, "got " + member.getType() + " " + clazz.getTypeName() + "." + member.getName());
+            if (Modifier.isStatic(member.getModifiers()) == wantStatic)
+                list.add(member);
+        }
+        return list;
+    }
+
+    private static List<Field> getFieldsFromClassLoader(Class<?> clazz, boolean wantStatic) {
+        try {
+            ensureFieldOffsets();
+            Class<?> clonedClass = loadCloneClass(clazz);
+            Field[] fields = clonedClass.getDeclaredFields();
+            List<Field> list = new ArrayList<>(fields.length);
+            for (Field field : fields) {
+                unsafe.putObject(field, fieldDeclaringClassOffset, clazz);
+                if (unsafe.getObject(field, fieldTypeOffset) == clonedClass) {
+                    unsafe.putObject(field, fieldTypeOffset, clazz);
+                }
+                if (Modifier.isStatic(field.getModifiers()) == wantStatic) {
+                    list.add(field);
+                }
+            }
+            return list;
+        } catch (ReflectiveOperationException | RuntimeException | LinkageError e) {
+            if (false) Log.w(TAG, "Failed to materialize fields with classloader", e);
+            return List.of();
+        }
+    }
+
+    private static Class<?> loadCloneClass(Class<?> clazz) throws ClassNotFoundException {
+        String className = clazz.getName();
+        for (String path : getFieldClassLoaderPaths()) {
+            try {
+                Class<?> clonedClass = getFieldClassLoader(path).loadClass(className);
+                if (clonedClass != clazz) return clonedClass;
+            } catch (ClassNotFoundException ignored) {
+            }
+        }
+        throw new ClassNotFoundException(className);
+    }
+
+    private static List<String> getFieldClassLoaderPaths() {
+        String bootClassPath = CoreOjClassLoader.getBootClassPath();
+        ArrayList<String> paths = new ArrayList<>();
+        addFieldClassLoaderPath(paths, bootClassPath, "/system/framework/framework.jar");
+        for (String path : bootClassPath.split(":")) {
+            addFieldClassLoaderPath(paths, bootClassPath, path);
+        }
+        return paths;
+    }
+
+    private static void addFieldClassLoaderPath(ArrayList<String> paths, String bootClassPath, String path) {
+        if (path.isEmpty() || paths.contains(path)) return;
+        if (bootClassPath.equals(path)
+                || bootClassPath.startsWith(path + ":")
+                || bootClassPath.endsWith(":" + path)
+                || bootClassPath.contains(":" + path + ":")) {
+            paths.add(path);
+        }
+    }
+
+    /**
+     * get declared static fields of given class without hidden api restriction
+     *
+     * @param clazz the class to fetch declared methods
+     * @return list of declared static fields of {@code clazz}
+     */
+    public static List<Field> getStaticFields(Class<?> clazz) {
+        if (clazz.isPrimitive() || clazz.isArray()) return List.of();
+        if (!staticFieldHandleSupported) return getFieldsFromClassLoader(clazz, true);
+        return getFieldsFromMethodHandle(clazz, true);
+    }
+
+    /**
+     * Sets the list of exemptions from hidden API access enforcement.
+     *
+     * @param signaturePrefixes A list of class signature prefixes. Each item in the list is a prefix match on the type
+     *                          signature of a blacklisted API. All matching APIs are treated as if they were on
+     *                          the whitelist: access permitted, and no logging..
+     * @return whether the operation is successful
+     */
+    public static boolean setHiddenApiExemptions(String... signaturePrefixes) {
+        try {
+            Object runtime = invoke(Class.forName("dalvik.system.VMRuntime"), null, "getRuntime");
+            invoke(Class.forName("dalvik.system.VMRuntime"), runtime, "setHiddenApiExemptions", (Object) signaturePrefixes);
+            return true;
+        } catch (ReflectiveOperationException e) {
+            Log.w(TAG, "setHiddenApiExemptions", e);
+            return false;
+        }
+    }
+
+    /**
+     * Adds the list of exemptions from hidden API access enforcement.
+     *
+     * @param signaturePrefixes A list of class signature prefixes. Each item in the list is a prefix match on the type
+     *                          signature of a blacklisted API. All matching APIs are treated as if they were on
+     *                          the whitelist: access permitted, and no logging..
+     * @return whether the operation is successful
+     */
+    public static boolean addHiddenApiExemptions(String... signaturePrefixes) {
+        Helper.signaturePrefixes.addAll(Arrays.asList(signaturePrefixes));
+        String[] strings = new String[Helper.signaturePrefixes.size()];
+        Helper.signaturePrefixes.toArray(strings);
+        return setHiddenApiExemptions(strings);
+    }
+
+    /**
+     * Clear the list of exemptions from hidden API access enforcement.
+     * Android runtime will cache access flags, so if a hidden API has been accessed unrestrictedly,
+     * running this method will not restore the restriction on it.
+     *
+     * @return whether the operation is successful
+     */
+    public static boolean clearHiddenApiExemptions() {
+        Helper.signaturePrefixes.clear();
+        return setHiddenApiExemptions();
+    }
+}
